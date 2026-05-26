@@ -16,27 +16,26 @@ internal sealed class SqliteDatabaseDriver : IDatabaseDriver
         if (string.IsNullOrWhiteSpace(path))
             throw new ArgumentException("SQLite path must not be empty.", nameof(uri));
 
-        return new SqliteDatabaseDriver(path);
+        var cs = path.Contains('=')
+            ? path
+            : new SqliteConnectionStringBuilder { DataSource = path, Mode = SqliteOpenMode.ReadWriteCreate, Cache = SqliteCacheMode.Shared }.ToString();
+
+        return new SqliteDatabaseDriver(cs);
     }
 
-    private readonly SqliteConnection _connection;
+    private readonly string _connectionString;
 
-    private SqliteDatabaseDriver(string filePath)
+    private SqliteDatabaseDriver(string connectionString)
     {
-        // Allow a plain path. SQLite also supports "Data Source=:memory:" etc.
-        var cs = filePath.Contains('=')
-            ? filePath
-            : new SqliteConnectionStringBuilder { DataSource = filePath, Mode = SqliteOpenMode.ReadWriteCreate, Cache = SqliteCacheMode.Shared }.ToString();
-
-        _connection = new SqliteConnection(cs);
+        _connectionString = connectionString;
     }
 
     public DbDialect Dialect => DbDialect.Sqlite;
 
     public async Task<IReadOnlyList<TableInfo>> ListTablesAsync(CancellationToken cancellationToken = default)
     {
-        await EnsureOpenAsync(cancellationToken).ConfigureAwait(false);
-        await using var cmd = _connection.CreateCommand();
+        await using var conn = await OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
+        await using var cmd = conn.CreateCommand();
         cmd.CommandText = @"SELECT name, type FROM sqlite_master
 WHERE type IN ('table','view') AND name NOT LIKE 'sqlite_%'
 ORDER BY name";
@@ -55,10 +54,10 @@ ORDER BY name";
     public async Task<TableDescription> DescribeTableAsync(string tableName, CancellationToken cancellationToken = default)
     {
         tableName.ValidateIdentifier();
-        await EnsureOpenAsync(cancellationToken).ConfigureAwait(false);
+        await using var conn = await OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
 
         var columns = new List<ColumnInfo>();
-        await using (var cmd = _connection.CreateCommand())
+        await using (var cmd = conn.CreateCommand())
         {
             cmd.CommandText = $"PRAGMA table_info(\"{tableName}\")";
             await using var reader = await cmd.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
@@ -80,7 +79,7 @@ ORDER BY name";
         var indexes = new List<IndexInfo>();
         var uniqueCols = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
-        await using (var cmd = _connection.CreateCommand())
+        await using (var cmd = conn.CreateCommand())
         {
             cmd.CommandText = $"PRAGMA index_list(\"{tableName}\")";
             await using var reader = await cmd.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
@@ -89,7 +88,7 @@ ORDER BY name";
                 var idxName = reader.GetString(reader.GetOrdinal("name"));
                 var unique = reader.GetInt32(reader.GetOrdinal("unique")) == 1;
 
-                var cols = await ReadIndexColumnsAsync(idxName, cancellationToken).ConfigureAwait(false);
+                var cols = await ReadIndexColumnsAsync(conn, idxName, cancellationToken).ConfigureAwait(false);
                 indexes.Add(new IndexInfo(idxName, unique, cols));
 
                 if (unique && cols.Count == 1)
@@ -100,7 +99,7 @@ ORDER BY name";
         columns = columns.Select(c => c with { IsUnique = !c.IsPrimaryKey && uniqueCols.Contains(c.Name) }).ToList();
 
         var foreignKeys = new List<ForeignKeyInfo>();
-        await using (var cmd = _connection.CreateCommand())
+        await using (var cmd = conn.CreateCommand())
         {
             cmd.CommandText = $"PRAGMA foreign_key_list(\"{tableName}\")";
             await using var reader = await cmd.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
@@ -120,9 +119,8 @@ ORDER BY name";
 
     public async Task<QueryResult> QueryAsync(string sql, int limit, CancellationToken cancellationToken = default)
     {
-        await EnsureOpenAsync(cancellationToken).ConfigureAwait(false);
-
-        await using var cmd = _connection.CreateCommand();
+        await using var conn = await OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
+        await using var cmd = conn.CreateCommand();
         cmd.CommandText = sql;
         await using var reader = await cmd.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
         return await reader.ReadResultAsync(limit, cancellationToken).ConfigureAwait(false);
@@ -130,9 +128,8 @@ ORDER BY name";
 
     public async Task<ExecutionResult> ExecuteAsync(string sql, CancellationToken cancellationToken = default)
     {
-        await EnsureOpenAsync(cancellationToken).ConfigureAwait(false);
-
-        await using var cmd = _connection.CreateCommand();
+        await using var conn = await OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
+        await using var cmd = conn.CreateCommand();
         cmd.CommandText = sql;
         var affected = await cmd.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
         return new ExecutionResult(affected);
@@ -140,12 +137,10 @@ ORDER BY name";
 
     public async Task<AnalyzeResult> AnalyzeQueryAsync(string sql, bool execute, TimeSpan timeout, CancellationToken cancellationToken = default)
     {
-        // SQLite does not have a safe built-in "EXPLAIN ANALYZE" equivalent; use EXPLAIN QUERY PLAN.
         var stripped = sql.Trim().TrimEnd(';');
 
-        await EnsureOpenAsync(cancellationToken).ConfigureAwait(false);
-
-        await using var cmd = _connection.CreateCommand();
+        await using var conn = await OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
+        await using var cmd = conn.CreateCommand();
         cmd.CommandText = $"EXPLAIN QUERY PLAN {stripped}";
 
         using var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
@@ -161,9 +156,7 @@ ORDER BY name";
             var raw = string.Join("\n", lines);
 
             if (execute)
-            {
                 raw += "\n\n(Note: SQLite does not support EXPLAIN ANALYZE. Showing plan-only output.)";
-            }
 
             return new AnalyzeResult(raw, Executed: false);
         }
@@ -173,31 +166,26 @@ ORDER BY name";
         }
     }
 
-    public async ValueTask DisposeAsync()
+    public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+
+    private async Task<SqliteConnection> OpenConnectionAsync(CancellationToken ct)
     {
-        await _connection.CloseAsync().ConfigureAwait(false);
-        await _connection.DisposeAsync().ConfigureAwait(false);
+        var conn = new SqliteConnection(_connectionString);
+        await conn.OpenAsync(ct).ConfigureAwait(false);
+        await using var pragma = conn.CreateCommand();
+        pragma.CommandText = "PRAGMA foreign_keys = ON;";
+        await pragma.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+        return conn;
     }
 
-    private async Task EnsureOpenAsync(CancellationToken cancellationToken)
-    {
-        if (_connection.State != ConnectionState.Open)
-        {
-            await _connection.OpenAsync(cancellationToken).ConfigureAwait(false);
-            await using var pragma = _connection.CreateCommand();
-            pragma.CommandText = "PRAGMA foreign_keys = ON;";
-            await pragma.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
-        }
-    }
-
-    private async Task<IReadOnlyList<string>> ReadIndexColumnsAsync(string indexName, CancellationToken cancellationToken)
+    private static async Task<IReadOnlyList<string>> ReadIndexColumnsAsync(SqliteConnection conn, string indexName, CancellationToken ct)
     {
         var cols = new List<string>();
-        await using var cmd = _connection.CreateCommand();
+        await using var cmd = conn.CreateCommand();
         cmd.CommandText = $"PRAGMA index_info(\"{indexName}\")";
-        await using var reader = await cmd.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
-        while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+        await using var reader = await cmd.ExecuteReaderAsync(ct).ConfigureAwait(false);
+        while (await reader.ReadAsync(ct).ConfigureAwait(false))
             cols.Add(reader.GetString(reader.GetOrdinal("name")));
         return cols;
-}
+    }
 }
