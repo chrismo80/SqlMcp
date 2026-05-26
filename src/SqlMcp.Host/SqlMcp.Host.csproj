@@ -22,7 +22,7 @@
     <PackageId>SqlMcp</PackageId>
     <PackAsTool>true</PackAsTool>
     <ToolCommandName>sqlmcp</ToolCommandName>
-    <Version>0.2.2</Version>
+    <Version>0.3.0</Version>
     <Authors>chrismo80</Authors>
     <Description>MCP server that gives agents accurate SQL database schema and safe data access — no more schema guessing.</Description>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
