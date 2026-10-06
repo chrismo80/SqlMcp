@@ -56,8 +56,19 @@ sqlmcp --db 'oracle://user:pass@localhost:1521//sid'
 
 | Flag | Default | Description |
 | :--- | :--- | :--- |
-| `--db <uri>` | required | Database connection URI |
+| `--db <uri>` | `$DATABASE_URL` | Database connection URI, falls back to the `DATABASE_URL` environment variable |
 | `--ssl` | false | Enable SSL/TLS for connection |
+
+If your project already exports `DATABASE_URL`, SqlMcp picks it up without further configuration:
+
+```bash
+export DATABASE_URL='postgres://user:pass@localhost:5432/db'
+sqlmcp
+```
+
+> [!WARNING]
+> `DATABASE_URL` usually holds your application's user, including write permissions.
+> Pass `--db` with a read-only user if the agent should not modify data.
 
 ## Available Tools
 

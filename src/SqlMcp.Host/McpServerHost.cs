@@ -5,6 +5,8 @@ namespace SqlMcp.Host;
 
 public static class McpServerHost
 {
+    internal const string DbUriEnvironmentVariable = "DATABASE_URL";
+
     public static async Task RunAsync(string[] args, CancellationToken cancellationToken = default)
     {
         var options = ParseOptions(args);
@@ -51,9 +53,11 @@ public static class McpServerHost
             }
         }
 
+        dbUri ??= Environment.GetEnvironmentVariable(DbUriEnvironmentVariable);
+
         if (string.IsNullOrWhiteSpace(dbUri))
             throw new ArgumentException(
-                "Database connection URI is required. Use --db <connection-uri>.", nameof(args));
+                $"Database connection URI is required. Use --db <connection-uri> or set {DbUriEnvironmentVariable}.", nameof(args));
 
         return new SqlMcpOptions(ConnectionUri: dbUri!, UseSsl: ssl);
     }
